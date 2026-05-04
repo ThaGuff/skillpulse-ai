@@ -8,26 +8,19 @@ import ResultsScreen from './ResultsScreen';
 import ErrorScreen from './ErrorScreen';
 import { analyzeSkillGaps } from './api';
 
-const SCREEN = {
-  SPLASH:  'splash',
-  QUIZ:    'quiz',
-  LOADING: 'loading',
-  RESULTS: 'results',
-  ERROR:   'error',
-};
-
+const SCREEN = { SPLASH: 'splash', QUIZ: 'quiz', LOADING: 'loading', RESULTS: 'results', ERROR: 'error' };
 const BLANK_ANSWERS = { role: '', experience: '', concerns: [], income: '', hours: '' };
 
 export default function App() {
-  const [screen,   setScreen]   = useState(SCREEN.SPLASH);
-  const [step,     setStep]     = useState(1);
-  const [answers,  setAnswers]  = useState(BLANK_ANSWERS);
+  const [screen, setScreen] = useState(SCREEN.SPLASH);
+  const [step, setStep] = useState(1);
+  const [answers, setAnswers] = useState(BLANK_ANSWERS);
   const [analysis, setAnalysis] = useState(null);
-  const [errMsg,   setErrMsg]   = useState('');
+  const [errMsg, setErrMsg] = useState('');
 
   function startQuiz() { setStep(1); setScreen(SCREEN.QUIZ); }
-  function nextStep()  { setStep(s => s + 1); }
-  function prevStep()  { setStep(s => Math.max(1, s - 1)); }
+  function nextStep() { setStep(s => s + 1); }
+  function prevStep() { setStep(s => Math.max(1, s - 1)); }
 
   async function runAnalysis() {
     setScreen(SCREEN.LOADING);
@@ -46,7 +39,6 @@ export default function App() {
     setAnalysis(null);
     setStep(1);
     setScreen(SCREEN.SPLASH);
-    // Clear any Stripe query params
     window.history.replaceState({}, '', '/');
   }
 
@@ -54,39 +46,15 @@ export default function App() {
     <>
       <GlobalStyles />
       <AppShell>
-
-        {screen === SCREEN.SPLASH && (
-          <SplashScreen onStart={startQuiz} />
-        )}
-
-        {screen === SCREEN.QUIZ && step === 1 && (
-          <Step1Role answers={answers} setAnswers={setAnswers} onNext={nextStep} />
-        )}
-        {screen === SCREEN.QUIZ && step === 2 && (
-          <Step2Experience answers={answers} setAnswers={setAnswers} onNext={nextStep} onBack={prevStep} />
-        )}
-        {screen === SCREEN.QUIZ && step === 3 && (
-          <Step3Concerns answers={answers} setAnswers={setAnswers} onNext={nextStep} onBack={prevStep} />
-        )}
-        {screen === SCREEN.QUIZ && step === 4 && (
-          <Step4Income answers={answers} setAnswers={setAnswers} onNext={nextStep} onBack={prevStep} />
-        )}
-        {screen === SCREEN.QUIZ && step === 5 && (
-          <Step5Hours answers={answers} setAnswers={setAnswers} onAnalyze={runAnalysis} onBack={prevStep} />
-        )}
-
-        {screen === SCREEN.LOADING && (
-          <LoadingScreen />
-        )}
-
-        {screen === SCREEN.RESULTS && analysis && (
-          <ResultsScreen analysis={analysis} answers={answers} onRestart={restart} />
-        )}
-
-        {screen === SCREEN.ERROR && (
-          <ErrorScreen message={errMsg} onRetry={restart} />
-        )}
-
+        {screen === SCREEN.SPLASH && <SplashScreen onStart={startQuiz} />}
+        {screen === SCREEN.QUIZ && step === 1 && <Step1Role answers={answers} setAnswers={setAnswers} onNext={nextStep} />}
+        {screen === SCREEN.QUIZ && step === 2 && <Step2Experience answers={answers} setAnswers={setAnswers} onNext={nextStep} onBack={prevStep} />}
+        {screen === SCREEN.QUIZ && step === 3 && <Step3Concerns answers={answers} setAnswers={setAnswers} onNext={nextStep} onBack={prevStep} />}
+        {screen === SCREEN.QUIZ && step === 4 && <Step4Income answers={answers} setAnswers={setAnswers} onNext={nextStep} onBack={prevStep} />}
+        {screen === SCREEN.QUIZ && step === 5 && <Step5Hours answers={answers} setAnswers={setAnswers} onAnalyze={runAnalysis} onBack={prevStep} />}
+        {screen === SCREEN.LOADING && <LoadingScreen />}
+        {screen === SCREEN.RESULTS && analysis && <ResultsScreen analysis={analysis} answers={answers} onRestart={restart} />}
+        {screen === SCREEN.ERROR && <ErrorScreen message={errMsg} onRetry={restart} />}
       </AppShell>
     </>
   );
