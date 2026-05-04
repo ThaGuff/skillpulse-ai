@@ -1,5 +1,3 @@
-// In production the React app is served by Express on the same origin,
-// so BASE is empty. In dev, CRA proxy forwards /api to :3001.
 const BASE = '';
 
 async function apiFetch(path, body) {
@@ -35,5 +33,5 @@ export async function generateLesson(skill, role, level) {
 
 export async function createCheckoutSession(email) {
   const data = await apiFetch('/api/stripe/checkout', { email });
-  return data.url; // Stripe checkout URL
+  return data.url;
 }
