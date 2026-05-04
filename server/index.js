@@ -16,27 +16,30 @@ const IS_PROD = process.env.NODE_ENV === "production";
 const BASE_URL = process.env.RAILWAY_PUBLIC_DOMAIN || `http://localhost:${PORT}`;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 
+// Valid Gemini v1beta model names (verified May 2026)
+// Primary: gemini-2.0-flash  |  Fallback: gemini-2.0-flash-lite
+const GEMINI_MODELS = ["gemini-2.0-flash", "gemini-2.0-flash-lite"];
+
 app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
-app.use(cors({
-  origin: IS_PROD ? true : ["http://localhost:3000", "http://localhost:3001"],
-  credentials: true,
-}));
+app.use(cors({ origin: true, credentials: true }));
 app.use("/api/stripe/webhook", express.raw({ type: "application/json" }));
 app.use(express.json({ limit: "10kb" }));
 
 const aiLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false, message: { error: "Too many requests — please wait a few minutes." } });
 const stripeLimiter = rateLimit({ windowMs: 60 * 1000, max: 20, message: { error: "Too many requests." } });
 
-// Retry Gemini call up to 3 times on rate limit
 async function callGemini(systemPrompt, userPrompt, maxTokens = 1400) {
-  const MODELS = ["gemini-2.0-flash", "gemini-1.5-flash"];
   let lastError;
 
-  for (const model of MODELS) {
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
-        const body = {
+  for (const model of GEMINI_MODELS) {
+    try {
+      console.log(`[gemini] trying model: ${model}`);
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
+
+      const resp = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
           system_instruction: { parts: [{ text: systemPrompt }] },
           contents: [{ role: "user", parts: [{ text: userPrompt }] }],
           generationConfig: {
@@ -44,51 +47,54 @@ async function callGemini(systemPrompt, userPrompt, maxTokens = 1400) {
             temperature: 0.7,
             responseMimeType: "application/json",
           },
-        };
+        }),
+      });
 
-        const resp = await fetch(url, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        });
-
-        if (resp.status === 429) {
-          // Rate limited — wait and retry with next model
-          console.warn(`[gemini] rate limit on ${model}, attempt ${attempt + 1}`);
-          lastError = Object.assign(new Error("AI rate limited"), { status: 429 });
-          if (attempt === 0) await new Promise(r => setTimeout(r, 8000)); // wait 8s then try same model once more
-          continue;
-        }
-
-        if (!resp.ok) {
-          const err = await resp.json().catch(() => ({}));
-          const msg = err?.error?.message || `Gemini API error ${resp.status}`;
-          console.error("[gemini]", resp.status, msg);
-          lastError = Object.assign(new Error(msg), { status: resp.status });
-          break; // don't retry non-rate-limit errors on same model
-        }
-
-        const data = await resp.json();
-        const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-        if (!text) throw new Error("Gemini returned an empty response");
-
-        console.log(`[gemini] success with ${model}`);
-        return text.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```\s*$/i, "").trim();
-
-      } catch (err) {
-        if (err.status !== 429) throw err;
-        lastError = err;
+      if (resp.status === 429) {
+        console.warn(`[gemini] rate limited on ${model}, trying next...`);
+        lastError = Object.assign(new Error("Rate limited"), { status: 429 });
+        // Small wait before trying next model
+        await new Promise(r => setTimeout(r, 2000));
+        continue;
       }
+
+      if (resp.status === 404) {
+        console.warn(`[gemini] model not found: ${model}, trying next...`);
+        lastError = Object.assign(new Error(`Model ${model} not found`), { status: 404 });
+        continue;
+      }
+
+      if (!resp.ok) {
+        const errBody = await resp.json().catch(() => ({}));
+        const msg = errBody?.error?.message || `Gemini error ${resp.status}`;
+        console.error(`[gemini] ${resp.status} on ${model}:`, msg);
+        lastError = Object.assign(new Error(msg), { status: resp.status });
+        continue;
+      }
+
+      const data = await resp.json();
+      const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+      if (!text) throw new Error("Gemini returned empty response");
+
+      console.log(`[gemini] success with ${model}`);
+      // Strip any accidental markdown fences
+      return text.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```\s*$/i, "").trim();
+
+    } catch (err) {
+      if (!err.status) throw err; // network error — bail immediately
+      lastError = err;
     }
   }
 
-  throw lastError || new Error("All Gemini models rate limited. Please try again in 30 seconds.");
+  throw lastError || new Error("All Gemini models failed. Please try again.");
 }
 
+// ── Health ────────────────────────────────────────────────────────────────────
 app.get("/api/health", (req, res) => {
-  res.json({ status: "ok", timestamp: new Date().toISOString(), ai: "gemini-2.0-flash + gemini-1.5-flash fallback", gemini: !!GEMINI_API_KEY, stripe: !!stripe });
+  res.json({ status: "ok", timestamp: new Date().toISOString(), models: GEMINI_MODELS, gemini: !!GEMINI_API_KEY, stripe: !!stripe });
 });
 
+// ── Analyze ───────────────────────────────────────────────────────────────────
 app.post("/api/analyze", aiLimiter, async (req, res) => {
   const { role, experience, concerns, income, hours } = req.body;
   if (!role || !experience || !Array.isArray(concerns) || !concerns.length || !income || !hours) {
@@ -96,34 +102,32 @@ app.post("/api/analyze", aiLimiter, async (req, res) => {
   }
 
   const system = `You are SkillPulse AI — a razor-sharp career strategist for freelancers and gig workers in 2026.
-You understand AI displacement deeply. You are direct, specific, and always tie advice to dollars earned.
-Never be vague. Every answer is tailored to the specific role and situation.
-You MUST respond with ONLY a valid JSON object. No markdown. No explanation. No text outside the JSON.`;
+You understand AI displacement deeply. Be direct, specific, tie every insight to money.
+CRITICAL: Respond with ONLY a valid JSON object. No markdown. No extra text.`;
 
   const user = `Analyze this freelancer's skill gaps:
-
 Role: ${role}
 Experience: ${experience}
-Top concerns: ${concerns.join(", ")}
-Current monthly income range: ${income}
-Weekly hours available to learn: ${hours}
+Concerns: ${concerns.join(", ")}
+Monthly income: ${income}
+Learning hours/week: ${hours}
 
-Return ONLY a valid JSON object with EXACTLY this shape:
+Return ONLY this exact JSON shape:
 {
   "headline": "6-8 words capturing their biggest opportunity",
-  "summary": "2-3 direct sentences about their situation and stakes. Mention their role.",
+  "summary": "2-3 direct sentences about their situation. Mention their role.",
   "riskScore": 7,
   "riskLabel": "High Risk",
   "topGaps": [
-    { "skill": "Skill Name", "urgency": "Critical", "earnBoost": "$800-$1,500/mo", "timeToLearn": "3 weeks", "why": "One sentence why this matters for their role." },
-    { "skill": "Skill Name", "urgency": "High", "earnBoost": "$400-$800/mo", "timeToLearn": "2 weeks", "why": "One sentence why." },
-    { "skill": "Skill Name", "urgency": "Medium", "earnBoost": "$200-$500/mo", "timeToLearn": "4 weeks", "why": "One sentence why." }
+    { "skill": "Skill Name", "urgency": "Critical", "earnBoost": "$800-$1,500/mo", "timeToLearn": "3 weeks", "why": "Why this matters for their role." },
+    { "skill": "Skill Name", "urgency": "High", "earnBoost": "$400-$800/mo", "timeToLearn": "2 weeks", "why": "Why this matters." },
+    { "skill": "Skill Name", "urgency": "Medium", "earnBoost": "$200-$500/mo", "timeToLearn": "4 weeks", "why": "Why this matters." }
   ],
-  "quickWin": "Start with a verb. One specific action for the next 7 days.",
+  "quickWin": "Verb-first. One action for the next 7 days.",
   "sixMonthPlan": [
-    { "month": "Month 1-2", "focus": "Skill or action", "milestone": "Concrete measurable result" },
-    { "month": "Month 3-4", "focus": "Skill or action", "milestone": "Concrete measurable result" },
-    { "month": "Month 5-6", "focus": "Skill or action", "milestone": "Concrete measurable result" }
+    { "month": "Month 1-2", "focus": "Focus area", "milestone": "Measurable result" },
+    { "month": "Month 3-4", "focus": "Focus area", "milestone": "Measurable result" },
+    { "month": "Month 5-6", "focus": "Focus area", "milestone": "Measurable result" }
   ],
   "currentMonthly": 2500,
   "projectedMonthly": 4800
@@ -132,39 +136,40 @@ Return ONLY a valid JSON object with EXACTLY this shape:
   try {
     const raw = await callGemini(system, user, 1400);
     const analysis = JSON.parse(raw);
-    if (!analysis.headline || !analysis.topGaps || !Array.isArray(analysis.topGaps)) throw new Error("Incomplete AI response — please try again.");
+    if (!analysis.headline || !Array.isArray(analysis.topGaps)) throw new Error("Incomplete response");
     res.json({ success: true, analysis });
   } catch (err) {
-    console.error("[analyze]", err.message);
+    console.error("[analyze error]", err.message);
     if (err instanceof SyntaxError) return res.status(500).json({ error: "AI returned malformed data. Please try again." });
+    if (err.status === 429) return res.status(503).json({ error: "AI is busy right now. Please wait 30 seconds and try again." });
     if (err.status === 400) return res.status(500).json({ error: "Invalid Gemini API key. Check GEMINI_API_KEY in Railway Variables." });
-    if (err.status === 429) return res.status(503).json({ error: "AI rate limit hit. Please wait 30 seconds and try again." });
     res.status(500).json({ error: err.message || "Analysis failed. Please try again." });
   }
 });
 
+// ── Lesson ────────────────────────────────────────────────────────────────────
 app.post("/api/lesson", aiLimiter, async (req, res) => {
   const { skill, role, level } = req.body;
   if (!skill || !role) return res.status(400).json({ error: "Missing skill or role." });
 
   const system = `You are SkillPulse AI, a punchy micro-learning coach for freelancers.
-You MUST respond with ONLY a valid JSON object. No markdown. No text outside the JSON.`;
+CRITICAL: Respond with ONLY a valid JSON object. No markdown. No extra text.`;
 
-  const user = `Create a 5-minute micro-lesson for a ${role} (${level || "growing"} experience) learning "${skill}".
+  const user = `5-minute lesson for a ${role} (${level || "growing"}) learning "${skill}".
 
-Return ONLY valid JSON:
+Return ONLY this JSON:
 {
-  "title": "Engaging lesson title that promises a clear outcome",
-  "hook": "One surprising stat or bold claim. No fluff.",
-  "coreConcept": "The single most important idea in 2-3 sentences.",
-  "practicalStep": "Start with a verb. One thing they can do TODAY.",
+  "title": "Lesson title with clear outcome",
+  "hook": "One surprising stat or claim. No fluff.",
+  "coreConcept": "The key idea in 2-3 sentences.",
+  "practicalStep": "Verb-first. One thing to do TODAY.",
   "quiz": {
-    "question": "A multiple-choice question testing understanding",
+    "question": "Multiple choice question",
     "options": ["A) option", "B) option", "C) option", "D) option"],
     "correct": "B",
-    "explanation": "Why B is correct in one sentence."
+    "explanation": "Why B is correct."
   },
-  "proTip": "Advanced insight that separates beginners from earners."
+  "proTip": "Advanced insight for earners, not beginners."
 }`;
 
   try {
@@ -173,43 +178,45 @@ Return ONLY valid JSON:
     if (!lesson.title || !lesson.coreConcept) throw new Error("Incomplete lesson");
     res.json({ success: true, lesson });
   } catch (err) {
-    console.error("[lesson]", err.message);
+    console.error("[lesson error]", err.message);
     res.status(500).json({ error: "Could not generate lesson. Please try again." });
   }
 });
 
+// ── Stripe checkout ───────────────────────────────────────────────────────────
 app.post("/api/stripe/checkout", stripeLimiter, async (req, res) => {
-  if (!stripe) return res.status(503).json({ error: "Payments not configured. Set STRIPE_SECRET_KEY." });
+  if (!stripe) return res.status(503).json({ error: "Payments not configured." });
   const priceId = process.env.STRIPE_PRICE_ID;
   if (!priceId) return res.status(503).json({ error: "STRIPE_PRICE_ID not set." });
-  const { email } = req.body;
   try {
     const session = await stripe.checkout.sessions.create({
       mode: "subscription", payment_method_types: ["card"],
       line_items: [{ price: priceId, quantity: 1 }],
       success_url: `${BASE_URL}/?subscribed=true`,
       cancel_url: `${BASE_URL}/?cancelled=true`,
-      customer_email: email || undefined,
+      customer_email: req.body.email || undefined,
       allow_promotion_codes: true,
-      subscription_data: { trial_period_days: 7, metadata: { source: "skillpulse_app" } },
+      subscription_data: { trial_period_days: 7 },
     });
     res.json({ success: true, url: session.url });
   } catch (err) {
-    console.error("[stripe checkout]", err.message);
     res.status(500).json({ error: "Could not create checkout session." });
   }
 });
 
+// ── Stripe webhook ────────────────────────────────────────────────────────────
 app.post("/api/stripe/webhook", async (req, res) => {
   if (!stripe || !process.env.STRIPE_WEBHOOK_SECRET) return res.sendStatus(200);
-  const sig = req.headers["stripe-signature"];
-  let event;
-  try { event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET); }
-  catch (err) { return res.status(400).send(`Webhook error: ${err.message}`); }
-  if (event.type === "checkout.session.completed") console.log("[webhook] New subscriber:", event.data.object.customer_email);
+  try {
+    const event = stripe.webhooks.constructEvent(req.body, req.headers["stripe-signature"], process.env.STRIPE_WEBHOOK_SECRET);
+    if (event.type === "checkout.session.completed") console.log("[stripe] new subscriber:", event.data.object.customer_email);
+  } catch (err) {
+    return res.status(400).send(`Webhook error: ${err.message}`);
+  }
   res.sendStatus(200);
 });
 
+// ── Static React build ────────────────────────────────────────────────────────
 if (IS_PROD) {
   const buildPath = path.join(__dirname, "../client/build");
   app.use(express.static(buildPath, { maxAge: "1d" }));
@@ -217,9 +224,9 @@ if (IS_PROD) {
 }
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`\n⚡ SkillPulse AI running on port ${PORT} [${IS_PROD ? "production" : "development"}]`);
-  console.log(`   AI engine : Gemini 2.0 Flash (w/ 1.5 Flash fallback)`);
-  console.log(`   Gemini key: ${GEMINI_API_KEY ? "✓ set" : "✗ MISSING"}`);
-  console.log(`   Health    → http://localhost:${PORT}/api/health`);
+  console.log(`\n⚡ SkillPulse AI — port ${PORT} [${IS_PROD ? "production" : "dev"}]`);
+  console.log(`   Models    : ${GEMINI_MODELS.join(" → ")}`);
+  console.log(`   Gemini key: ${GEMINI_API_KEY ? "✓ set (" + GEMINI_API_KEY.substring(0,8) + "...)" : "✗ MISSING"}`);
+  console.log(`   Stripe    : ${stripe ? "✓" : "✗ not configured"}`);
   console.log("");
 });
