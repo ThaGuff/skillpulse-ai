@@ -18,50 +18,75 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY || "";
 
 app.use(helmet({ contentSecurityPolicy: false, crossOriginEmbedderPolicy: false }));
 app.use(cors({
-  origin: IS_PROD ? BASE_URL : ["http://localhost:3000", "http://localhost:3001"],
+  origin: IS_PROD ? true : ["http://localhost:3000", "http://localhost:3001"],
   credentials: true,
 }));
 app.use("/api/stripe/webhook", express.raw({ type: "application/json" }));
 app.use(express.json({ limit: "10kb" }));
 
-const aiLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false, message: { error: "Too many requests — please wait a few minutes." } });
+const aiLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 30, standardHeaders: true, legacyHeaders: false, message: { error: "Too many requests — please wait a few minutes." } });
 const stripeLimiter = rateLimit({ windowMs: 60 * 1000, max: 20, message: { error: "Too many requests." } });
 
+// Retry Gemini call up to 3 times on rate limit
 async function callGemini(systemPrompt, userPrompt, maxTokens = 1400) {
-  const model = "gemini-2.0-flash";
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
+  const MODELS = ["gemini-2.0-flash", "gemini-1.5-flash"];
+  let lastError;
 
-  const body = {
-    system_instruction: { parts: [{ text: systemPrompt }] },
-    contents: [{ role: "user", parts: [{ text: userPrompt }] }],
-    generationConfig: {
-      maxOutputTokens: maxTokens,
-      temperature: 0.7,
-      responseMimeType: "application/json",
-    },
-  };
+  for (const model of MODELS) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${GEMINI_API_KEY}`;
+        const body = {
+          system_instruction: { parts: [{ text: systemPrompt }] },
+          contents: [{ role: "user", parts: [{ text: userPrompt }] }],
+          generationConfig: {
+            maxOutputTokens: maxTokens,
+            temperature: 0.7,
+            responseMimeType: "application/json",
+          },
+        };
 
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+        const resp = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
 
-  if (!resp.ok) {
-    const err = await resp.json().catch(() => ({}));
-    const msg = err?.error?.message || `Gemini API error ${resp.status}`;
-    console.error("[gemini]", resp.status, msg);
-    throw Object.assign(new Error(msg), { status: resp.status });
+        if (resp.status === 429) {
+          // Rate limited — wait and retry with next model
+          console.warn(`[gemini] rate limit on ${model}, attempt ${attempt + 1}`);
+          lastError = Object.assign(new Error("AI rate limited"), { status: 429 });
+          if (attempt === 0) await new Promise(r => setTimeout(r, 8000)); // wait 8s then try same model once more
+          continue;
+        }
+
+        if (!resp.ok) {
+          const err = await resp.json().catch(() => ({}));
+          const msg = err?.error?.message || `Gemini API error ${resp.status}`;
+          console.error("[gemini]", resp.status, msg);
+          lastError = Object.assign(new Error(msg), { status: resp.status });
+          break; // don't retry non-rate-limit errors on same model
+        }
+
+        const data = await resp.json();
+        const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+        if (!text) throw new Error("Gemini returned an empty response");
+
+        console.log(`[gemini] success with ${model}`);
+        return text.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```\s*$/i, "").trim();
+
+      } catch (err) {
+        if (err.status !== 429) throw err;
+        lastError = err;
+      }
+    }
   }
 
-  const data = await resp.json();
-  const text = data?.candidates?.[0]?.content?.parts?.[0]?.text || "";
-  if (!text) throw new Error("Gemini returned an empty response");
-  return text.replace(/^```json\s*/i, "").replace(/^```\s*/i, "").replace(/```\s*$/i, "").trim();
+  throw lastError || new Error("All Gemini models rate limited. Please try again in 30 seconds.");
 }
 
 app.get("/api/health", (req, res) => {
-  res.json({ status: "ok", timestamp: new Date().toISOString(), ai: "gemini-2.0-flash", gemini: !!GEMINI_API_KEY, stripe: !!stripe });
+  res.json({ status: "ok", timestamp: new Date().toISOString(), ai: "gemini-2.0-flash + gemini-1.5-flash fallback", gemini: !!GEMINI_API_KEY, stripe: !!stripe });
 });
 
 app.post("/api/analyze", aiLimiter, async (req, res) => {
@@ -107,13 +132,13 @@ Return ONLY a valid JSON object with EXACTLY this shape:
   try {
     const raw = await callGemini(system, user, 1400);
     const analysis = JSON.parse(raw);
-    if (!analysis.headline || !analysis.topGaps || !Array.isArray(analysis.topGaps)) throw new Error("Incomplete AI response");
+    if (!analysis.headline || !analysis.topGaps || !Array.isArray(analysis.topGaps)) throw new Error("Incomplete AI response — please try again.");
     res.json({ success: true, analysis });
   } catch (err) {
     console.error("[analyze]", err.message);
     if (err instanceof SyntaxError) return res.status(500).json({ error: "AI returned malformed data. Please try again." });
     if (err.status === 400) return res.status(500).json({ error: "Invalid Gemini API key. Check GEMINI_API_KEY in Railway Variables." });
-    if (err.status === 429) return res.status(503).json({ error: "AI rate limit hit. Please try again in 30 seconds." });
+    if (err.status === 429) return res.status(503).json({ error: "AI rate limit hit. Please wait 30 seconds and try again." });
     res.status(500).json({ error: err.message || "Analysis failed. Please try again." });
   }
 });
@@ -193,9 +218,8 @@ if (IS_PROD) {
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`\n⚡ SkillPulse AI running on port ${PORT} [${IS_PROD ? "production" : "development"}]`);
-  console.log(`   AI engine : Gemini 2.0 Flash`);
+  console.log(`   AI engine : Gemini 2.0 Flash (w/ 1.5 Flash fallback)`);
+  console.log(`   Gemini key: ${GEMINI_API_KEY ? "✓ set" : "✗ MISSING"}`);
   console.log(`   Health    → http://localhost:${PORT}/api/health`);
-  if (!GEMINI_API_KEY) console.warn("   ⚠️  GEMINI_API_KEY missing!");
-  if (!stripe) console.warn("   ⚠️  Stripe not configured");
   console.log("");
 });
